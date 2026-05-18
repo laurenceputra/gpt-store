@@ -1,0 +1,26 @@
+name = "memory-mcp"
+main = "src/index.ts"
+compatibility_date = "2026-05-18"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "memory"
+database_id = "<D1_DATABASE_ID>"
+
+[[vectorize]]
+binding = "VECTORIZE"
+index_name = "memory-index"
+
+[[queues.producers]]
+binding = "INDEX_QUEUE"
+queue = "memory-index-queue"
+
+[[queues.consumers]]
+queue = "memory-index-queue"
+
+[[r2_buckets]]
+binding = "MEMORY_BUCKET"
+bucket_name = "memory-raw"
+
+[ai]
+binding = "AI"
