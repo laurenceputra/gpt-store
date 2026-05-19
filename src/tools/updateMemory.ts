@@ -1,14 +1,17 @@
+import { assertRole, requireTenant } from "../auth/auth";
 import { getMemoryById, insertAuditLog, isValidMemoryType, isValidStatus, replaceTags, saveVersion, updateMemory } from "../db/d1";
 import type { ToolContext } from "../types";
 
 const DISALLOWED_FOR_EXECUTED = /(review_state|draft|candidate|planned|proposed|pending)/i;
 
 export async function updateMemoryTool(input: any, ctx: ToolContext) {
+  assertRole(ctx.auth, ["tenant_writer", "tenant_admin"]);
+  const tenantId = requireTenant(ctx.auth);
   const id = String(input?.id ?? "");
   const change_reason = String(input?.change_reason ?? "").trim();
   if (!id) throw new Error("id required");
   if (!change_reason) throw new Error("change_reason required");
-  const existing = await getMemoryById(ctx.env, id);
+  const existing = await getMemoryById(ctx.env, tenantId, id);
   if (!existing) throw new Error("memory not found");
 
   const title = String(input?.title ?? existing.title).trim();
@@ -31,12 +34,12 @@ export async function updateMemoryTool(input: any, ctx: ToolContext) {
     throw new Error("cannot overwrite executed_state with review/proposed content");
   }
 
-  await saveVersion(ctx.env, id, existing.body, body, change_reason);
-  await updateMemory(ctx.env, id, { title, body, status, source: source ?? null, memory_type });
+  await saveVersion(ctx.env, tenantId, id, existing.body, body, change_reason, ctx.auth.apiKeyId);
+  await updateMemory(ctx.env, tenantId, id, { title, body, status, source: source ?? null, memory_type });
   if (Array.isArray(input?.tags)) {
-    await replaceTags(ctx.env, id, input.tags.map(String));
+    await replaceTags(ctx.env, tenantId, id, input.tags.map(String).map((tag: string) => tag.trim()).filter(Boolean).slice(0, 50));
   }
-  await insertAuditLog(ctx.env, "update_memory", id, { change_reason });
-  await ctx.env.INDEX_QUEUE.send({ memory_id: id });
+  await insertAuditLog(ctx.env, ctx.auth, "update_memory", id, { change_reason });
+  await ctx.env.INDEX_QUEUE.send({ tenant_id: tenantId, memory_id: id });
   return { id, updated: true, indexing: "queued" };
 }

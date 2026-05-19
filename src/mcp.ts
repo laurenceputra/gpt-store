@@ -1,12 +1,13 @@
 import { archiveMemory } from "./tools/archiveMemory";
+import { incrementUsage } from "./db/d1";
 import { getMemory } from "./tools/getMemory";
 import { listRecentMemory } from "./tools/listRecentMemory";
 import { searchMemory } from "./tools/searchMemory";
 import { updateMemoryTool } from "./tools/updateMemory";
 import { writeMemory } from "./tools/writeMemory";
-import type { Env } from "./types";
+import type { AuthContext, Env } from "./types";
 
-const tools: Record<string, (args: any, ctx: { env: Env }) => Promise<any>> = {
+const tools: Record<string, (args: any, ctx: { env: Env; auth: AuthContext }) => Promise<any>> = {
   search_memory: searchMemory,
   get_memory: getMemory,
   write_memory: writeMemory,
@@ -14,6 +15,9 @@ const tools: Record<string, (args: any, ctx: { env: Env }) => Promise<any>> = {
   list_recent_memory: listRecentMemory,
   archive_memory: archiveMemory
 };
+
+const readTools = new Set(["search_memory", "get_memory", "list_recent_memory"]);
+const writeTools = new Set(["write_memory", "update_memory", "archive_memory"]);
 
 const toolDefinitions = [
   {
@@ -123,7 +127,11 @@ function rpcError(id: unknown, code: number, message: string): Response {
   return Response.json({ jsonrpc: "2.0", id, error: { code, message } });
 }
 
-export async function handleMcp(req: Request, env: Env): Promise<Response> {
+function isSafeRpcMessage(message: string): boolean {
+  return /^[a-z0-9_]+$/.test(message) || message === "query required";
+}
+
+export async function handleMcp(req: Request, env: Env, auth: AuthContext): Promise<Response> {
   let requestId: string | number | null = null;
   try {
     const raw = await req.text();
@@ -161,7 +169,9 @@ export async function handleMcp(req: Request, env: Env): Promise<Response> {
         if (typeof args !== "object" || args === null || Array.isArray(args)) {
           return rpcError(id, -32600, "Invalid Request");
         }
-        const result = await tool(args, { env });
+        const result = await tool(args, { env, auth });
+        if (auth.tenantId && readTools.has(name)) void incrementUsage(env, auth.tenantId, "mcp_reads").catch(() => undefined);
+        if (auth.tenantId && writeTools.has(name)) void incrementUsage(env, auth.tenantId, "mcp_writes").catch(() => undefined);
         return rpcResult(id, {
           content: [{ type: "text", text: JSON.stringify(result) }],
           structuredContent: result
@@ -174,6 +184,9 @@ export async function handleMcp(req: Request, env: Env): Promise<Response> {
     if (err instanceof SyntaxError) {
       return rpcError(null, -32700, "Parse error");
     }
-    return rpcError(requestId, -32000, err instanceof Error ? err.message : "Internal error");
+    if (err instanceof Error && isSafeRpcMessage(err.message)) {
+      return rpcError(requestId, -32000, err.message);
+    }
+    return rpcError(requestId, -32000, "Internal error");
   }
 }

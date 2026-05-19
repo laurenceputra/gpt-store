@@ -1,9 +1,6 @@
-import { listActive } from "../db/d1";
+import { reindexTenantMemory } from "../jobs/jobs";
+import type { Env } from "../types";
 
-export async function reindexMemory(env: any) {
-  const rows = await listActive(env);
-  for (const row of rows) {
-    await env.INDEX_QUEUE.send({ memory_id: row.id });
-  }
-  return { queued: rows.length };
+export async function reindexMemory(env: Env, tenantId: string) {
+  return reindexTenantMemory(env, tenantId);
 }

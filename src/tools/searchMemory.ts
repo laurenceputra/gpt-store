@@ -1,9 +1,12 @@
-import { getMemoryById, getTags, searchKeyword } from "../db/d1";
+import { assertRole, requireTenant } from "../auth/auth";
+import { getMemoryById, getTags, incrementUsage, searchKeyword } from "../db/d1";
 import { embedText } from "../vector/embed";
 import { queryVectors } from "../vector/vectorize";
 import type { ToolContext } from "../types";
 
 export async function searchMemory(input: any, ctx: ToolContext) {
+  assertRole(ctx.auth, ["tenant_reader", "tenant_writer", "tenant_admin"]);
+  const tenantId = requireTenant(ctx.auth);
   const query = String(input?.query ?? "").trim();
   if (!query) throw new Error("query required");
   const limit = Math.min(20, Math.max(1, Number(input?.limit ?? 8)));
@@ -23,18 +26,19 @@ export async function searchMemory(input: any, ctx: ToolContext) {
       if (namespace) filter.namespace = namespace;
       if (project_key !== undefined) filter.project_key = project_key;
       if (memory_type) filter.memory_type = memory_type;
-      ids.push(...(await queryVectors(ctx.env, vector, limit, Object.keys(filter).length ? (filter as VectorizeVectorMetadataFilter) : undefined)));
+      void incrementUsage(ctx.env, tenantId, "vector_queries").catch(() => undefined);
+      ids.push(...(await queryVectors(ctx.env, vector, limit, tenantId, Object.keys(filter).length ? (filter as VectorizeVectorMetadataFilter) : undefined)));
     }
   } catch {
     // fallback below
   }
 
-  const semanticRows = (await Promise.all(ids.map((id) => getMemoryById(ctx.env, id)))).filter(Boolean) as any[];
+  const semanticRows = (await Promise.all(ids.map((id) => getMemoryById(ctx.env, tenantId, id)))).filter(Boolean) as any[];
   const semantic = tags?.length
     ? (
         await Promise.all(
           semanticRows.map(async (row) => {
-            const rowTags = (await getTags(ctx.env, row.id)).map((t) => String(t).trim());
+            const rowTags = (await getTags(ctx.env, tenantId, row.id)).map((t) => String(t).trim());
             semanticTagsById.set(row.id, rowTags);
             const hasAllTags = tags.every((tag: string) => rowTags.includes(tag));
             return hasAllTags ? row : null;
@@ -42,7 +46,7 @@ export async function searchMemory(input: any, ctx: ToolContext) {
         )
       ).filter(Boolean) as any[]
     : semanticRows;
-  const keyword = await searchKeyword(ctx.env, query, includeArchived, limit, { namespace, project_key, memory_type: memory_type as any, tags });
+  const keyword = await searchKeyword(ctx.env, tenantId, query, includeArchived, limit, { namespace, project_key, memory_type: memory_type as any, tags });
   const merged = new Map<string, any>();
   for (const row of semantic) merged.set(row.id, { ...row, score: 2 });
   for (const row of keyword) {
@@ -64,7 +68,7 @@ export async function searchMemory(input: any, ctx: ToolContext) {
         project_key: m.project_key,
         memory_type: m.memory_type,
         updated_at: m.updated_at,
-        tags: semanticTagsById.get(m.id) ?? await getTags(ctx.env, m.id),
+        tags: semanticTagsById.get(m.id) ?? await getTags(ctx.env, tenantId, m.id),
         snippet: m.body.slice(0, 180)
       }))
   );

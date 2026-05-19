@@ -1,126 +1,162 @@
 # memory-mcp-cloudflare
 
-Production-focused MVP external memory server for MCP on Cloudflare Workers.
+Multi-tenant MCP external memory server for Cloudflare Workers.
 
 ## What this service does
 
-This service provides an MCP-compatible external memory backend for agents and ChatGPT projects.
-
-- Stores canonical memory records in Cloudflare D1.
-- Supports typed memory states (for example executed vs review/proposed state).
-- Performs asynchronous semantic indexing into Vectorize for retrieval.
-- Maintains audit trails and versioning metadata.
-- Exposes admin endpoints for export and reindex operations.
+- Stores tenant-scoped memory records in Cloudflare D1.
+- Uses bespoke API keys for all customer and operator access.
+- Supports MCP memory tools for search, read, write, update, list, and archive.
+- Indexes active memories asynchronously into Vectorize for semantic retrieval.
+- Tracks audit metadata with tenant, API key, and actor role.
+- Runs export and reindex operations as tenant-scoped jobs.
 
 ## Architecture
-
-Text diagram:
 
 ```text
 Client / ChatGPT MCP Connector
             |
             v
-  Cloudflare Worker (/mcp, /admin/*, /health)
-      |              |                 |
-      |              |                 +--> Audit/event logs (D1 audit_log)
-      |              +--> Admin tasks (export/reindex)
-      |
-      +--> D1 (source of truth: memories, tags, versions)
-      |
-      +--> Queue (index jobs)
-                 |
-                 v
-          Workers AI embeddings
-                 |
-                 v
-             Vectorize index
-
-Admin export path:
-Worker /admin/export -> D1 scan -> JSONL -> R2 object storage
+  Cloudflare Worker (/mcp, /v1/*, /health)
+       |             |             |
+       |             |             +--> D1 audit_log / jobs / usage_daily
+       |             +--> Control plane: tenants, keys, jobs
+       |
+       +--> D1 source of truth: tenant-scoped memories
+       |
+       +--> Queue: index and job work
+                  |
+                  v
+           Workers AI embeddings
+                  |
+                  v
+              Vectorize index with tenant_id metadata
 ```
 
-Core routes:
-- `GET /health` (public health check)
-- `POST /mcp` (MCP endpoint, bearer protected)
-- `GET /admin/export` (admin bearer)
-- `GET /admin/reindex` (admin bearer)
+## Core routes
+
+- `GET /health` public health check
+- `POST /v1/bootstrap` first-run operator key creation
+- `GET /v1/me` current key identity
+- `GET /v1/keys` list visible API keys
+- `POST /v1/keys` create API key
+- `POST /v1/keys/:id/revoke` revoke API key
+- `POST /v1/platform/tenants` operator-only tenant creation
+- `POST /v1/jobs/export` create tenant export job
+- `POST /v1/jobs/reindex` create tenant reindex job
+- `GET /v1/jobs/:id` inspect job status
+- `POST /mcp` tenant-scoped MCP endpoint
 
 ## Setup prerequisites
 
-- Node.js 20+ (recommended current LTS)
-- npm (or project package manager)
-- Cloudflare account with Workers, D1, Queues, R2, Vectorize enabled
-- Wrangler v3 (`npx wrangler --version`)
+- Node.js 20+
+- npm
+- Cloudflare account with Workers, D1, Queues, R2, Vectorize, and Workers AI enabled
+- Wrangler v3
 
-> Commands below use placeholders like `<ACCOUNT_ID>`, `<DB_NAME>`, and `<INDEX_NAME>`. Replace them before running.
+## Cloudflare resources
 
-## Create Cloudflare resources (Wrangler v3)
+Create and wire these resources in `wrangler.toml`:
 
-### 1) D1 database
+- D1 database bound as `DB`
+- Vectorize index bound as `VECTORIZE`
+- Queue bound as `INDEX_QUEUE`
+- R2 bucket bound as `MEMORY_BUCKET`
+- Workers AI binding as `AI`
 
-- Create:
-  - `npx wrangler d1 create <DB_NAME>`
-- Apply local/remote migrations after wiring IDs in `wrangler.toml`:
-  - `npm run migrate:local`
-  - `npm run migrate:remote`
+Apply migrations after replacing placeholders in `wrangler.toml`:
 
-### 2) Vectorize index
+```bash
+npm run migrate:local
+npm run migrate:remote
+```
 
-Use dimensions for `bge-base-en-v1.5` embeddings (768):
+## Secrets
 
-- `npx wrangler vectorize create <INDEX_NAME> --dimensions=768 --metric=cosine`
+Set these secrets:
 
-### 3) R2 bucket
+```bash
+npx wrangler secret put BOOTSTRAP_TOKEN
+npx wrangler secret put AUTH_PEPPER
+```
 
-- `npx wrangler r2 bucket create <R2_BUCKET_NAME>`
+- `BOOTSTRAP_TOKEN` is used only to create the first operator API key.
+- `AUTH_PEPPER` is mixed into API key secret hashes. Keep it stable and private.
 
-### 4) Queue (index pipeline)
+## GitHub deployment workflow
 
-- `npx wrangler queues create <QUEUE_NAME>`
+`.github/workflows/deploy.yml` deploys on `push` to `main` and on manual `workflow_dispatch`.
 
-After creation, update `wrangler.toml` bindings (D1 DB id, Vectorize index, R2 bucket, Queue producer/consumer).
+Required GitHub repository secrets:
 
-## Initial setup
+- `CLOUDFLARE_API_TOKEN`
+- `CLOUDFLARE_ACCOUNT_ID`
+- `BOOTSTRAP_TOKEN`
+- `AUTH_PEPPER`
 
-1. Install dependencies:
-   - `npm install`
-2. Configure `wrangler.toml` with the created resource names/IDs.
-3. Set secrets (never commit secrets):
-   - `npx wrangler secret put MCP_BEARER_TOKEN`
-   - `npx wrangler secret put ADMIN_BEARER_TOKEN`
-4. Run migrations:
-   - `npm run migrate:local`
-   - `npm run migrate:remote`
+Before enabling the workflow, replace `wrangler.toml` placeholders (for example `database_id = "<D1_DATABASE_ID>"`) and ensure referenced D1/Vectorize/Queue/R2/AI resources already exist.
+
+Deploy order in CI:
+
+1. `npm ci`
+2. `npm run typecheck`
+3. `npm test`
+4. Sync Worker secrets (`BOOTSTRAP_TOKEN`, `AUTH_PEPPER`)
+5. Apply remote D1 migrations
+6. Deploy Worker
+
+## First-run bootstrap
+
+After deployment, create the first operator key:
+
+```bash
+curl -sS -X POST \
+  -H "Authorization: Bearer <BOOTSTRAP_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{"label":"Initial operator"}' \
+  "https://<YOUR_WORKER_DOMAIN>/v1/bootstrap"
+```
+
+The returned API key secret is shown once. Store it securely.
+
+## Create a tenant and initial tenant admin key
+
+```bash
+curl -sS -X POST \
+  -H "Authorization: Bearer <OPERATOR_API_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{"slug":"acme","name":"Acme","initial_admin_key_label":"Acme admin"}' \
+  "https://<YOUR_WORKER_DOMAIN>/v1/platform/tenants"
+```
+
+Use the returned tenant admin key to create reader/writer keys through `/v1/keys`.
+
+## MCP auth model
+
+Use a tenant-scoped API key with:
+
+```text
+Authorization: Bearer <TENANT_API_KEY>
+```
+
+Roles:
+
+- `tenant_reader`: search/list/get memory
+- `tenant_writer`: reader permissions plus write/update/archive
+- `tenant_admin`: writer permissions plus key and job management
+- `operator`: platform tenant/key administration, not accepted for `/mcp`
 
 ## Local development
 
-- Start local dev server:
-  - `npm run dev`
-- Health check:
-  - `curl -i http://127.0.0.1:8787/health`
-- Stream logs during local sessions:
-  - `npx wrangler tail`
-
-## Deployment
-
-- Deploy Worker:
-  - `npm run deploy`
-- Verify production health:
-  - `curl -i "https://<YOUR_WORKER_DOMAIN>/health"`
-
-## Security model
-
-- `/mcp` and `/admin/*` require bearer auth.
-- D1 is the authoritative store; Vectorize is a derived index.
-- Writes are validated server-side for memory type/state rules.
-- Audit log captures write/update/archive style operations.
-- Secrets are stored via Wrangler secrets, not repository files.
-- Admin token should be scoped operationally and rotated regularly.
+```bash
+npm install
+npm run typecheck
+npm test
+npm run dev
+```
 
 ## Known limitations
 
-- Retrieval/ranking remains MVP-level heuristic quality.
-- Vector deletion behavior can depend on current Vectorize API capabilities.
-- Queue retry/backoff behavior primarily relies on platform defaults unless explicitly tuned.
-- Reindex/export are admin-triggered operations (not fully autonomous workflows).
-- Cross-region consistency and very high-volume throughput tuning are out of scope for this MVP.
+- Public signup, browser login, billing, and custom scopes are intentionally out of scope for v1.
+- Shared D1/Vectorize infrastructure relies on strict application-level tenant filtering.
+- Export and reindex jobs are queue-backed but intentionally simple; add pagination/checkpointing before very large tenant datasets.

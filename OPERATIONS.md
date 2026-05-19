@@ -1,93 +1,101 @@
 # Operations Guide
 
-## Backups / export
+## GitHub deploy pipeline
 
-Purpose: produce a D1 snapshot export in JSONL and store it in R2.
+The deploy workflow (`.github/workflows/deploy.yml`) requires repository secrets:
 
-1. Trigger export using admin bearer (replace placeholders):
-   - `curl -sS -H "Authorization: Bearer <ADMIN_BEARER_TOKEN>" "https://<YOUR_WORKER_DOMAIN>/admin/export"`
-2. Confirm generated object in R2 bucket (Wrangler v3):
-   - `npx wrangler r2 object list <R2_BUCKET_NAME> --prefix exports/`
-3. Download a specific backup file when needed:
-   - `npx wrangler r2 object get <R2_BUCKET_NAME>/exports/memory-export-<TIMESTAMP>.jsonl --file ./memory-export-<TIMESTAMP>.jsonl`
+- `CLOUDFLARE_API_TOKEN`
+- `CLOUDFLARE_ACCOUNT_ID`
+- `BOOTSTRAP_TOKEN`
+- `AUTH_PEPPER`
 
-Recommended cadence:
-- Minimum daily export for active environments.
-- Keep immutable dated backups and apply lifecycle retention policy on the bucket.
+It runs checks (`npm ci`, `npm run typecheck`, `npm test`), syncs `BOOTSTRAP_TOKEN` and `AUTH_PEPPER` to Worker secrets, applies remote D1 migrations, and then deploys the Worker.
+
+## Bootstrap
+
+Create the first operator key once:
+
+```bash
+curl -sS -X POST \
+  -H "Authorization: Bearer <BOOTSTRAP_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{"label":"Initial operator"}' \
+  "https://<YOUR_WORKER_DOMAIN>/v1/bootstrap"
+```
+
+Bootstrap returns `409 bootstrap_already_completed` after any operator key exists.
+
+If you upgraded from a pre-tenant database, legacy data is imported into tenant slug `legacy-import` (id `tenant_legacy_import`); create scoped keys for that tenant or move data to a new tenant as needed.
+
+## Tenant onboarding
+
+Create a tenant and initial tenant admin key:
+
+```bash
+curl -sS -X POST \
+  -H "Authorization: Bearer <OPERATOR_API_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{"slug":"acme","name":"Acme","initial_admin_key_label":"Acme admin"}' \
+  "https://<YOUR_WORKER_DOMAIN>/v1/platform/tenants"
+```
+
+## Key rotation
+
+1. Create a replacement key with `/v1/keys`.
+2. Update the client/connector to use the replacement key.
+3. Revoke the old key with `/v1/keys/:id/revoke`.
+4. Validate old key is rejected and new key succeeds.
+
+## Export
+
+Create a tenant export job:
+
+```bash
+curl -sS -X POST \
+  -H "Authorization: Bearer <TENANT_ADMIN_API_KEY>" \
+  "https://<YOUR_WORKER_DOMAIN>/v1/jobs/export"
+```
+
+Poll job status:
+
+```bash
+curl -sS -H "Authorization: Bearer <TENANT_ADMIN_API_KEY>" \
+  "https://<YOUR_WORKER_DOMAIN>/v1/jobs/<JOB_ID>"
+```
+
+Successful exports write JSONL to R2 under `exports/<TENANT_ID>/`.
 
 ## Reindex
 
-Purpose: rebuild Vectorize index entries from D1 source-of-truth records.
+Create a tenant reindex job:
 
-1. Trigger reindex:
-   - `curl -sS -H "Authorization: Bearer <ADMIN_BEARER_TOKEN>" "https://<YOUR_WORKER_DOMAIN>/admin/reindex"`
-2. Confirm queue/worker processing via logs:
-   - `npx wrangler tail`
-3. Validate by running representative semantic search queries through MCP.
+```bash
+curl -sS -X POST \
+  -H "Authorization: Bearer <TENANT_ADMIN_API_KEY>" \
+  "https://<YOUR_WORKER_DOMAIN>/v1/jobs/reindex"
+```
 
-When to run:
-- After embedding model changes.
-- After index schema/dimension migration.
-- After incidents causing queue consumer failure.
-
-## Token rotation
-
-1. Rotate MCP token:
-   - `npx wrangler secret put MCP_BEARER_TOKEN`
-2. Rotate admin token:
-   - `npx wrangler secret put ADMIN_BEARER_TOKEN`
-3. Deploy updated secrets:
-   - `npx wrangler deploy`
-4. Update all clients/connectors to use new values.
-5. Validate old tokens are rejected and new tokens succeed.
-
-Notes:
-- Never store real tokens in docs, code, tickets, or chat logs.
-- Prefer emergency rotation immediately after suspected leakage.
+Run after embedding model changes, Vectorize migrations, or queue/indexing incidents.
 
 ## Audit logs
 
-`audit_log` records write/update/archive style operations.
+`audit_log` includes tenant, API key, actor role, action, memory id, and request summary.
 
-Inspection examples:
+Example D1 query:
 
-- Local D1 (if configured):
-  - `npx wrangler d1 execute <DB_NAME> --local --command "SELECT created_at, actor, action, memory_id FROM audit_log ORDER BY created_at DESC LIMIT 50;"`
-- Remote D1:
-  - `npx wrangler d1 execute <DB_NAME> --remote --command "SELECT created_at, actor, action, memory_id FROM audit_log ORDER BY created_at DESC LIMIT 50;"`
-- Filter by memory id:
-  - `npx wrangler d1 execute <DB_NAME> --remote --command "SELECT created_at, actor, action, request_summary FROM audit_log WHERE memory_id = '<MEMORY_ID>' ORDER BY created_at DESC;"`
+```bash
+npx wrangler d1 execute <DB_NAME> --remote --command \
+  "SELECT created_at, tenant_id, api_key_id, actor_role, action, memory_id FROM audit_log ORDER BY created_at DESC LIMIT 50;"
+```
+
+## Usage
+
+`usage_daily` tracks coarse per-tenant counters for cost visibility. Use it to identify high-cost tenants before adding billing or hard quotas.
 
 ## Vector inconsistency recovery
 
-Symptoms:
-- D1 record exists but semantic retrieval misses it.
-- Search returns stale/archived content.
-
-Recovery playbook:
-
-1. Verify D1 truth for affected IDs.
-2. Trigger `/admin/reindex` to rebuild active vectors.
-3. Re-run representative retrieval queries.
-4. If stale vectors persist, perform index-level cleanup/migration strategy, then reindex.
-5. Record incident details and remediation in operational notes.
-
-Important:
-- Treat D1 as source of truth.
-- Do not delete D1 records to “fix” Vectorize drift.
-
-## Adding memory types
-
-Add new memory types safely with a compatibility-first rollout:
-
-1. Define the new type and its semantics in code-level validation.
-2. Ensure separation rules remain explicit (for example executed state vs review/proposed state).
-3. Update MCP tool schemas and client-facing docs.
-4. Add migration/compatibility handling for existing records if needed.
-5. Deploy behind operational caution (small controlled rollout first).
-6. Verify audit_log captures the new type’s write/update lifecycle.
-7. Reindex if retrieval behavior depends on changed indexing metadata.
-
-Guardrails:
-- Never reinterpret existing stored types silently.
-- Prefer additive rollout over in-place semantic breaking changes.
+1. Verify D1 truth for the affected tenant and memory ids.
+2. Trigger `/v1/jobs/reindex` for the tenant.
+3. Poll job status until succeeded.
+4. Re-run representative searches.
+5. If stale archived vectors persist, perform index cleanup/migration and reindex again.

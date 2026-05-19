@@ -1,6 +1,5 @@
-import { exportMemory } from "./admin/exportMemory";
-import { reindexMemory } from "./admin/reindexMemory";
-import { requireToken } from "./auth/auth";
+import { authenticateRequest, jsonError, roleForbidden } from "./auth/auth";
+import { handleBootstrap, handleControlRequest } from "./control/control";
 import { handleMcp } from "./mcp";
 import { handleIndexQueue } from "./queues/indexMemory";
 import type { Env } from "./types";
@@ -11,22 +10,25 @@ export default {
     if (url.pathname === "/health") {
       return Response.json({ ok: true, service: "memory-mcp-cloudflare" });
     }
+    if (url.pathname === "/v1/bootstrap") {
+      return handleBootstrap(request, env);
+    }
+
     if (url.pathname === "/mcp") {
-      const auth = requireToken(request, env.MCP_BEARER_TOKEN);
-      if (auth) return auth;
-      return handleMcp(request, env);
+      const auth = await authenticateRequest(request, env);
+      if (auth instanceof Response) return auth;
+      const forbidden = roleForbidden(auth, ["tenant_reader", "tenant_writer", "tenant_admin"]);
+      if (forbidden) return forbidden;
+      return handleMcp(request, env, auth);
     }
-    if (url.pathname === "/admin/export") {
-      const auth = requireToken(request, env.ADMIN_BEARER_TOKEN);
-      if (auth) return auth;
-      return Response.json(await exportMemory(env));
+
+    if (url.pathname.startsWith("/v1/")) {
+      const auth = await authenticateRequest(request, env);
+      if (auth instanceof Response) return auth;
+      return handleControlRequest(request, env, auth);
     }
-    if (url.pathname === "/admin/reindex") {
-      const auth = requireToken(request, env.ADMIN_BEARER_TOKEN);
-      if (auth) return auth;
-      return Response.json(await reindexMemory(env));
-    }
-    return new Response("Not Found", { status: 404 });
+
+    return jsonError(404, "not_found");
   },
 
   async queue(batch: MessageBatch<any>, env: Env): Promise<void> {

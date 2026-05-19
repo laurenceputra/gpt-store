@@ -14,8 +14,9 @@ import { updateMemoryTool } from "../src/tools/updateMemory";
 
 describe("validation", () => {
   it("updating executed_state with proposed content fails", async () => {
+    const auth = { apiKeyId: "k1", tenantId: "t1", role: "tenant_writer", keyLabel: "writer" } as const;
     await expect(
-      updateMemoryTool({ id: "x", change_reason: "edit", body: "proposed approach" }, { env: { INDEX_QUEUE: { send: vi.fn() } } as any })
+      updateMemoryTool({ id: "x", change_reason: "edit", body: "proposed approach" }, { env: { INDEX_QUEUE: { send: vi.fn() } } as any, auth })
     ).rejects.toThrow(/cannot overwrite executed_state/);
   });
 });
